@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    volumes:
+      - .:/app
+    working_dir: /app
+    tty: true
+    ports:
+      - "7860:7860"
+    runtime: nvidia
+    # command: >
+    #       bash -c "CUDA_VISIBLE_DEVICES=0 python -m videollava.serve.looking_at --model-path 'LanguageBind/Video-LLaVA-7B' --file 'udpsrc port=9857 ! application/x-rtp, encoding-name=H264 ! rtph264depay ! avdec_h264 ! videoconvert ! appsink' --load-4bit"
