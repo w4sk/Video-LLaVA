@@ -13,6 +13,5 @@ services:
     runtime: nvidia
     env_file:
       - .env 
-    # command: >
-    #       bash -c "python -m videollava.serve.looking_at --model-path 'LanguageBind/Video-LLaVA-7B' --file 'udpsrc port=9857 ! application/x-rtp, encoding-name=H264 ! rtph264depay ! avdec_h264 ! videoconvert ! appsink' --load-4bit"
-    #       bash -c "python -m videollava.serve.video_llava_server --output /app/videollava/serve/output.mp4 --model-path 'LanguageBind/Video-LLaVA-7B' --load-4bit"
+    command: >
+      bash -c "python -m videollava.serve.video_llava_server --output /app/videollava/serve/output.mp4 --model-path 'LanguageBind/Video-LLaVA-7B' --load-4bit"
