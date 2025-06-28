@@ -6,9 +6,6 @@ import torch
 import socket
 import argparse
 import threading
-from PIL import Image
-from copy import copy
-from io import BytesIO
 from collections import deque
 from transformers import TextStreamer
 
@@ -18,14 +15,11 @@ from videollava.constants import (
     DEFAULT_IMAGE_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IM_END_TOKEN,
-    DEFAULT_VIDEO_TOKEN,
 )
 from videollava.conversation import conv_templates, SeparatorStyle
 from videollava.model.builder import load_pretrained_model
-from videollava.serve.utils import load_image, image_ext, video_ext
 from videollava.utils import disable_torch_init
 from videollava.mm_utils import (
-    process_images,
     tokenizer_image_token,
     get_model_name_from_path,
     KeywordsStoppingCriteria,
@@ -103,7 +97,10 @@ class VideoCaptureThread(threading.Thread):
         return frames
 
 
-def send_udp_message(message: str, host: str, port: int):
+def send_udp_message(message: str, host: str, port: int, format_function=None):
+    if format_function:
+        message = format_function(message)
+
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         if isinstance(message, bytes):
             sock.sendto(message, (host, port))
@@ -130,7 +127,7 @@ def main(args):
     disable_torch_init()
 
     model_name = get_model_name_from_path(args.model_path)
-    tokenizer, model, processor, context_len = load_pretrained_model(
+    tokenizer, model, processor, _ = load_pretrained_model(
         args.model_path,
         args.model_base,
         model_name,
@@ -162,7 +159,7 @@ def main(args):
     # GStreamer Settings
     video_thread = VideoCaptureThread(port=args.port, output=args.output)
     video_thread.start()
-    
+
     # Socket Settings
     udp_host = os.environ.get("UDP_TARGET_HOST")
     if not udp_host:
@@ -170,7 +167,7 @@ def main(args):
     udp_port = int(os.environ.get("UDP_TARGET_PORT"))
     if not udp_host:
         raise ValueError("UDP_TARGET_PORT environment variable must be set")
-    
+
     if args.save_output:
         print("frame save activated")
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -186,10 +183,6 @@ def main(args):
             if current_time - last_frame_time >= 1 / args.fps:
                 try:
                     conv = conv_templates[args.conv_mode].copy()
-                    if "mpt" in model_name.lower():
-                        roles = ("user", "assistant")
-                    else:
-                        roles = conv.roles
 
                     tensor = []
                     special_token = []
@@ -202,22 +195,33 @@ def main(args):
                         os.makedirs(frame_directory, exist_ok=True)
                         frame_no += 1
                         for i, latest_frame in enumerate(frames):
-                            frame_filename = os.path.join(frame_directory, f"frame_{i}.jpg")
+                            frame_filename = os.path.join(
+                                frame_directory, f"frame_{i}.jpg"
+                            )
                             cv2.imwrite(frame_filename, latest_frame)
 
-                    video_tensor = extract_image_features(frames=frames, video_processor=video_processor)[
-                        "pixel_values"
-                    ][0].to(model.device, dtype=torch.float16)
-                    special_token += [DEFAULT_IMAGE_TOKEN] * model.get_video_tower().config.num_frames
+                    video_tensor = extract_image_features(
+                        frames=frames, video_processor=video_processor
+                    )["pixel_values"][0].to(model.device, dtype=torch.float16)
+                    special_token += [
+                        DEFAULT_IMAGE_TOKEN
+                    ] * model.get_video_tower().config.num_frames
                     tensor.append(video_tensor)
                     if not tensor:
                         continue
                     inp = os.environ.get("INPUT_PROMPT")
                     if not inp:
-                        raise ValueError("INPUT_PROMPT environment variable must be set")
+                        raise ValueError(
+                            "INPUT_PROMPT environment variable must be set"
+                        )
                     if getattr(model.config, "mm_use_im_start_end", False):
                         inp = (
-                            "".join([DEFAULT_IM_START_TOKEN + i + DEFAULT_IM_END_TOKEN for i in special_token])
+                            "".join(
+                                [
+                                    DEFAULT_IM_START_TOKEN + i + DEFAULT_IM_END_TOKEN
+                                    for i in special_token
+                                ]
+                            )
                             + "\n"
                             + inp
                         )
@@ -228,16 +232,25 @@ def main(args):
 
                     input_ids = (
                         tokenizer_image_token(
-                            prompt=prompt, tokenizer=tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors="pt"
+                            prompt=prompt,
+                            tokenizer=tokenizer,
+                            image_token_index=IMAGE_TOKEN_INDEX,
+                            return_tensors="pt",
                         )
                         .unsqueeze(0)
                         .to(model.device)
                     )
 
-                    stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+                    stop_str = (
+                        conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+                    )
                     keywords = [stop_str]
-                    stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-                    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+                    stopping_criteria = KeywordsStoppingCriteria(
+                        keywords, tokenizer, input_ids
+                    )
+                    streamer = TextStreamer(
+                        tokenizer, skip_prompt=True, skip_special_tokens=True
+                    )
 
                     with torch.inference_mode():
                         output_ids = model.generate(
@@ -250,12 +263,19 @@ def main(args):
                             use_cache=True,
                             stopping_criteria=[stopping_criteria],
                         )
-                        outputs = tokenizer.decode(output_ids[0, input_ids.shape[1] :]).strip()
+                        outputs = tokenizer.decode(
+                            output_ids[0, input_ids.shape[1] :]
+                        ).strip()
                         conv.messages[-1][-1] = outputs
                         outputs = outputs.lower()
                         print(f"model outputs: {outputs}")
-                        
-                        send_udp_message(message=outputs.encode("utf-8"), host=udp_host, port=udp_port)
+
+                        send_udp_message(
+                            message=outputs.encode("utf-8"),
+                            host=udp_host,
+                            port=udp_port,
+                            format_function=None,
+                        )
 
                     last_frame_time = current_time
 
@@ -282,15 +302,21 @@ if __name__ == "__main__":
     parser.add_argument("--load-8bit", action="store_true")
     parser.add_argument("--load-4bit", action="store_true")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--port", type=int, default=7860, help="Port number for the UDP source.")
     parser.add_argument(
-        "--output", default=None, help="Path to save the output video file (e.g. output.mp4). If omitted, no recording."
+        "--port", type=int, default=7860, help="Port number for the UDP source."
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Path to save the output video file (e.g. output.mp4). If omitted, no recording.",
     )
     parser.add_argument(
         "--save_output",
         default=None,
         help="Path to save the output frame directory (e.g. /app/output). If omitted, no recording.",
     )
-    parser.add_argument("--fps", type=float, default=0.3, help="Frames per second for frame capture.")
+    parser.add_argument(
+        "--fps", type=float, default=0.3, help="Frames per second for frame capture."
+    )
     args = parser.parse_args()
     main(args)
