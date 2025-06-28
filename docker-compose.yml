@@ -9,6 +9,10 @@ services:
     tty: true
     ports:
       - "7860:7860/udp"
+      - "49152:49152/udp"
     runtime: nvidia
+    env_file:
+      - .env 
     # command: >
-    #       bash -c "CUDA_VISIBLE_DEVICES=0 python -m videollava.serve.looking_at --model-path 'LanguageBind/Video-LLaVA-7B' --file 'udpsrc port=9857 ! application/x-rtp, encoding-name=H264 ! rtph264depay ! avdec_h264 ! videoconvert ! appsink' --load-4bit"
+    #       bash -c "python -m videollava.serve.looking_at --model-path 'LanguageBind/Video-LLaVA-7B' --file 'udpsrc port=9857 ! application/x-rtp, encoding-name=H264 ! rtph264depay ! avdec_h264 ! videoconvert ! appsink' --load-4bit"
+    #       bash -c "python -m videollava.serve.video_llava_server --output /app/videollava/serve/output.mp4 --model-path 'LanguageBind/Video-LLaVA-7B' --load-4bit"

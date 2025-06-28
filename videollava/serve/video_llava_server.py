@@ -105,7 +105,10 @@ class VideoCaptureThread(threading.Thread):
 
 def send_udp_message(message: str, host: str, port: int):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.sendto(message.encode("utf-8"), (host, port))
+        if isinstance(message, bytes):
+            sock.sendto(message, (host, port))
+        else:
+            sock.sendto(message.encode("utf-8"), (host, port))
         print(f"Sent: {message} to {(host, port)}")
 
 
@@ -136,7 +139,7 @@ def main(args):
         device=args.device,
         cache_dir=args.cache_dir,
     )
-    image_processor, video_processor = processor["image"], processor["video"]
+    _, video_processor = processor["image"], processor["video"]
 
     if "llama-2" in model_name.lower():
         conv_mode = "llava_llama_2"
@@ -159,8 +162,15 @@ def main(args):
     # GStreamer Settings
     video_thread = VideoCaptureThread(port=args.port, output=args.output)
     video_thread.start()
-
-    print(f"\nfps: {args.fps}")
+    
+    # Socket Settings
+    udp_host = os.environ.get("UDP_TARGET_HOST")
+    if not udp_host:
+        raise ValueError("UDP_TARGET_HOST environment variable must be set")
+    udp_port = int(os.environ.get("UDP_TARGET_PORT"))
+    if not udp_host:
+        raise ValueError("UDP_TARGET_PORT environment variable must be set")
+    
     if args.save_output:
         print("frame save activated")
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -171,85 +181,90 @@ def main(args):
     try:
         last_frame_time = time.time()
         while True:
-            try:
-                conv = conv_templates[args.conv_mode].copy()
-                if "mpt" in model_name.lower():
-                    roles = ("user", "assistant")
-                else:
-                    roles = conv.roles
 
-                tensor = []
-                special_token = []
-                frames = video_thread.get_latest_frames(fps=args.fps, num_frames=8)
-                if not frames:
+            current_time = time.time()
+            if current_time - last_frame_time >= 1 / args.fps:
+                try:
+                    conv = conv_templates[args.conv_mode].copy()
+                    if "mpt" in model_name.lower():
+                        roles = ("user", "assistant")
+                    else:
+                        roles = conv.roles
+
+                    tensor = []
+                    special_token = []
+                    frames = video_thread.get_latest_frames(fps=args.fps, num_frames=8)
+                    if not frames:
+                        continue
+
+                    if args.save_output:
+                        frame_directory = os.path.join(directory, f"{frame_no}")
+                        os.makedirs(frame_directory, exist_ok=True)
+                        frame_no += 1
+                        for i, latest_frame in enumerate(frames):
+                            frame_filename = os.path.join(frame_directory, f"frame_{i}.jpg")
+                            cv2.imwrite(frame_filename, latest_frame)
+
+                    video_tensor = extract_image_features(frames=frames, video_processor=video_processor)[
+                        "pixel_values"
+                    ][0].to(model.device, dtype=torch.float16)
+                    special_token += [DEFAULT_IMAGE_TOKEN] * model.get_video_tower().config.num_frames
+                    tensor.append(video_tensor)
+                    if not tensor:
+                        continue
+                    inp = os.environ.get("INPUT_PROMPT")
+                    if not inp:
+                        raise ValueError("INPUT_PROMPT environment variable must be set")
+                    if getattr(model.config, "mm_use_im_start_end", False):
+                        inp = (
+                            "".join([DEFAULT_IM_START_TOKEN + i + DEFAULT_IM_END_TOKEN for i in special_token])
+                            + "\n"
+                            + inp
+                        )
+                    else:
+                        inp = "".join(special_token) + "\n" + inp
+                    conv.append_message(conv.roles[0], inp)
+                    prompt = conv.get_prompt()
+
+                    input_ids = (
+                        tokenizer_image_token(
+                            prompt=prompt, tokenizer=tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors="pt"
+                        )
+                        .unsqueeze(0)
+                        .to(model.device)
+                    )
+
+                    stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+                    keywords = [stop_str]
+                    stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+                    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+                    with torch.inference_mode():
+                        output_ids = model.generate(
+                            input_ids,
+                            images=tensor,
+                            do_sample=True if args.temperature > 0 else False,
+                            temperature=args.temperature,
+                            max_new_tokens=args.max_new_tokens,
+                            streamer=streamer,
+                            use_cache=True,
+                            stopping_criteria=[stopping_criteria],
+                        )
+                        outputs = tokenizer.decode(output_ids[0, input_ids.shape[1] :]).strip()
+                        conv.messages[-1][-1] = outputs
+                        outputs = outputs.lower()
+                        print(f"model outputs: {outputs}")
+                        
+                        send_udp_message(message=outputs.encode("utf-8"), host=udp_host, port=udp_port)
+
+                    last_frame_time = current_time
+
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except IndexError as e:
+                    print(f"Error during generation: {e}")
+                    print("Retrying...")
                     continue
-                video_tensor = extract_image_features(frames=frames, video_processor=video_processor)["pixel_values"][
-                    0
-                ].to(model.device, dtype=torch.float16)
-                special_token += [DEFAULT_IMAGE_TOKEN] * model.get_video_tower().config.num_frames
-                tensor.append(video_tensor)
-                if not tensor:
-                    continue
-
-                inp = "What is this person looking at?"
-                if getattr(model.config, "mm_use_im_start_end", False):
-                    inp = (
-                        "".join([DEFAULT_IM_START_TOKEN + i + DEFAULT_IM_END_TOKEN for i in special_token]) + "\n" + inp
-                    )
-                else:
-                    inp = "".join(special_token) + "\n" + inp
-                conv.append_message(conv.roles[0], inp)
-                prompt = conv.get_prompt()
-
-                input_ids = (
-                    tokenizer_image_token(
-                        prompt=prompt, tokenizer=tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors="pt"
-                    )
-                    .unsqueeze(0)
-                    .to(model.device)
-                )
-
-                stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-                keywords = [stop_str]
-                stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-                streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-
-                with torch.inference_mode():
-                    output_ids = model.generate(
-                        input_ids,
-                        images=tensor,
-                        do_sample=True if args.temperature > 0 else False,
-                        temperature=args.temperature,
-                        max_new_tokens=args.max_new_tokens,
-                        streamer=streamer,
-                        use_cache=True,
-                        stopping_criteria=[stopping_criteria],
-                    )
-                    outputs = tokenizer.decode(output_ids[0, input_ids.shape[1] :]).strip()
-                    conv.messages[-1][-1] = outputs
-                    outputs = outputs.lower()
-                    print(f"model outputs: {outputs}")
-
-                # current_time = time.time()
-                # if current_time - last_frame_time >= 1 / args.fps:
-                #     if args.save_output:
-                #         frames = video_thread.get_latest_frames(fps=args.fps, num_frames=5)
-                #         if frames:
-                #             frame_directory = os.path.join(directory, f"{frame_no}")
-                #             os.makedirs(frame_directory, exist_ok=True)
-                #             print(f"frame saving directory: {frame_directory}")
-                #             frame_no += 1
-                #             for i, latest_frame in enumerate(frames):
-                #                 frame_filename = os.path.join(frame_directory, f"frame_{i}.jpg")
-                #                 cv2.imwrite(frame_filename, latest_frame)
-                #     last_frame_time = current_time
-
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-            except IndexError as e:
-                print(f"Error during generation: {e}")
-                print("Retrying...")
-                continue
     finally:
         video_thread.stop()
         video_thread.join()
@@ -260,7 +275,6 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str, default="LanguageBind/Video-LLaVA-7B")
     parser.add_argument("--model-base", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default=None)
-    parser.add_argument("--file", nargs="+", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--conv-mode", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=0.2)
