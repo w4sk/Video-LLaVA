@@ -121,6 +121,8 @@ def extract_image_features(frames, video_processor):
 
     return {"pixel_values": image_features}
 
+def format_message(message):
+    return message.replace("</s>", "")
 
 def main(args):
     # Video-LLaVa Settings
@@ -271,10 +273,10 @@ def main(args):
                         print(f"model outputs: {outputs}")
 
                         send_udp_message(
-                            message=outputs.encode("utf-8"),
+                            message=outputs,
                             host=udp_host,
                             port=udp_port,
-                            format_function=None,
+                            format_function=format_message,
                         )
 
                     last_frame_time = current_time
