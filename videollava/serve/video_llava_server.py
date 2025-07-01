@@ -1,9 +1,11 @@
 import os
 import sys
 import cv2
+import json
 import time
 import torch
 import socket
+import datetime
 import argparse
 import threading
 from collections import deque
@@ -97,16 +99,31 @@ class VideoCaptureThread(threading.Thread):
         return frames
 
 
-def send_udp_message(message: str, host: str, port: int, format_function=None):
-    if format_function:
-        message = format_function(message)
+class UDPMessageSender:
+    def __init__(self, host: str, port: int, max_messages: int = 100):
+        self.host = host
+        self.port = port
+        self.messages = deque(maxlen=max_messages)
 
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        if isinstance(message, bytes):
-            sock.sendto(message, (host, port))
+    def send_message(self, message: str, format_function=None, history_num=None):
+        if format_function:
+            message = format_function(message)
+        messages_to_send = []
+        if history_num is not None:
+            messages_to_send.extend(self.get_sent_messages(count=history_num))
+        messages_to_send.append(message)
+        full_message = "\n".join(messages_to_send)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(full_message.encode("utf-8"), (self.host, self.port))
+            print(f"Sent: {full_message} to {(self.host, self.port)}")
+        self.messages.append(message)
+
+    def get_sent_messages(self, count: int = None):
+        if count is None or len(self.messages) < count:
+            return list(self.messages)
         else:
-            sock.sendto(message.encode("utf-8"), (host, port))
-        print(f"Sent: {message} to {(host, port)}")
+            return list(self.messages)[-count:]
 
 
 def extract_image_features(frames, video_processor):
@@ -121,13 +138,14 @@ def extract_image_features(frames, video_processor):
 
     return {"pixel_values": image_features}
 
+
 def format_message(message):
     return message.replace("</s>", "")
+
 
 def main(args):
     # Video-LLaVa Settings
     disable_torch_init()
-
     model_name = get_model_name_from_path(args.model_path)
     tokenizer, model, processor, _ = load_pretrained_model(
         args.model_path,
@@ -169,6 +187,7 @@ def main(args):
     udp_port = int(os.environ.get("UDP_TARGET_PORT"))
     if not udp_host:
         raise ValueError("UDP_TARGET_PORT environment variable must be set")
+    upd_sender = UDPMessageSender(host=udp_host, port=udp_port, max_messages=5)
 
     if args.save_output:
         print("frame save activated")
@@ -192,38 +211,19 @@ def main(args):
                     if not frames:
                         continue
 
-                    if args.save_output:
-                        frame_directory = os.path.join(directory, f"{frame_no}")
-                        os.makedirs(frame_directory, exist_ok=True)
-                        frame_no += 1
-                        for i, latest_frame in enumerate(frames):
-                            frame_filename = os.path.join(
-                                frame_directory, f"frame_{i}.jpg"
-                            )
-                            cv2.imwrite(frame_filename, latest_frame)
-
-                    video_tensor = extract_image_features(
-                        frames=frames, video_processor=video_processor
-                    )["pixel_values"][0].to(model.device, dtype=torch.float16)
-                    special_token += [
-                        DEFAULT_IMAGE_TOKEN
-                    ] * model.get_video_tower().config.num_frames
+                    video_tensor = extract_image_features(frames=frames, video_processor=video_processor)[
+                        "pixel_values"
+                    ][0].to(model.device, dtype=torch.float16)
+                    special_token += [DEFAULT_IMAGE_TOKEN] * model.get_video_tower().config.num_frames
                     tensor.append(video_tensor)
                     if not tensor:
                         continue
-                    inp = os.environ.get("INPUT_PROMPT")
+                    inp = args.prompt if args.prompt else os.environ.get("INPUT_PROMPT")
                     if not inp:
-                        raise ValueError(
-                            "INPUT_PROMPT environment variable must be set"
-                        )
+                        raise ValueError("INPUT_PROMPT environment variable must be set")
                     if getattr(model.config, "mm_use_im_start_end", False):
                         inp = (
-                            "".join(
-                                [
-                                    DEFAULT_IM_START_TOKEN + i + DEFAULT_IM_END_TOKEN
-                                    for i in special_token
-                                ]
-                            )
+                            "".join([DEFAULT_IM_START_TOKEN + i + DEFAULT_IM_END_TOKEN for i in special_token])
                             + "\n"
                             + inp
                         )
@@ -231,6 +231,7 @@ def main(args):
                         inp = "".join(special_token) + "\n" + inp
                     conv.append_message(conv.roles[0], inp)
                     prompt = conv.get_prompt()
+                    print(f"prompt: {prompt}")
 
                     input_ids = (
                         tokenizer_image_token(
@@ -243,16 +244,10 @@ def main(args):
                         .to(model.device)
                     )
 
-                    stop_str = (
-                        conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-                    )
+                    stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
                     keywords = [stop_str]
-                    stopping_criteria = KeywordsStoppingCriteria(
-                        keywords, tokenizer, input_ids
-                    )
-                    streamer = TextStreamer(
-                        tokenizer, skip_prompt=True, skip_special_tokens=True
-                    )
+                    stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+                    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
                     with torch.inference_mode():
                         output_ids = model.generate(
@@ -265,19 +260,36 @@ def main(args):
                             use_cache=True,
                             stopping_criteria=[stopping_criteria],
                         )
-                        outputs = tokenizer.decode(
-                            output_ids[0, input_ids.shape[1] :]
-                        ).strip()
+                        outputs = tokenizer.decode(output_ids[0, input_ids.shape[1] :]).strip()
                         conv.messages[-1][-1] = outputs
                         outputs = outputs.lower()
                         print(f"model outputs: {outputs}")
 
-                        send_udp_message(
-                            message=outputs,
-                            host=udp_host,
-                            port=udp_port,
-                            format_function=format_message,
-                        )
+                        if args.save_output:
+                            frame_directory = os.path.join(directory, f"{frame_no}")
+                            os.makedirs(frame_directory, exist_ok=True)
+                            frame_no += 1
+                            for i, latest_frame in enumerate(frames):
+                                frame_filename = os.path.join(frame_directory, f"frame_{i}.jpg")
+                                cv2.imwrite(frame_filename, latest_frame)
+                            llm_output_path = os.path.join(frame_directory, "llm_output.json")
+                            nine_hours_in_seconds = 9 * 3600
+                            frame_received_time_human = datetime.datetime.fromtimestamp(
+                                current_time + nine_hours_in_seconds
+                            ).strftime("%Y-%m-%d %H:%M:%S")
+                            llm_reasoning_time_human = datetime.datetime.fromtimestamp(
+                                time.time() + nine_hours_in_seconds
+                            ).strftime("%Y-%m-%d %H:%M:%S")
+                            llm_data = {
+                                "frame_recieved_time": frame_received_time_human,
+                                "llm_reasoning_time": llm_reasoning_time_human,
+                                "llm_input": prompt,
+                                "llm_output": outputs,
+                            }
+                            with open(llm_output_path, "w") as json_file:
+                                json.dump(llm_data, json_file, ensure_ascii=False, indent=4)
+
+                        upd_sender.send_message(message=outputs, format_function=format_message, history_num=5)
 
                     last_frame_time = current_time
 
@@ -304,9 +316,7 @@ if __name__ == "__main__":
     parser.add_argument("--load-8bit", action="store_true")
     parser.add_argument("--load-4bit", action="store_true")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument(
-        "--port", type=int, default=7860, help="Port number for the UDP source."
-    )
+    parser.add_argument("--port", type=int, default=7860, help="Port number for the UDP source.")
     parser.add_argument(
         "--output",
         default=None,
@@ -317,8 +327,12 @@ if __name__ == "__main__":
         default=None,
         help="Path to save the output frame directory (e.g. /app/output). If omitted, no recording.",
     )
+    parser.add_argument("--fps", type=float, default=0.3, help="Frames per second for frame capture.")
     parser.add_argument(
-        "--fps", type=float, default=0.3, help="Frames per second for frame capture."
+        "--prompt",
+        type=str,
+        required=True,
+        help="Input prompt for the model.",
     )
     args = parser.parse_args()
     main(args)
