@@ -1,3 +1,4 @@
+from ast import arg
 import os
 import sys
 import cv2
@@ -9,6 +10,7 @@ import datetime
 import argparse
 import threading
 from collections import deque
+from dotenv import load_dotenv
 from transformers import TextStreamer
 
 
@@ -110,14 +112,27 @@ class UDPMessageSender:
             message = format_function(message)
         messages_to_send = []
         if history_num is not None:
-            messages_to_send.extend(self.get_sent_messages(count=history_num))
+            messages_to_send.extend(self.get_sent_messages(count=history_num - 1))
         messages_to_send.append(message)
         full_message = "\n".join(messages_to_send)
 
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.sendto(full_message.encode("utf-8"), (self.host, self.port))
-            print(f"Sent: {full_message} to {(self.host, self.port)}")
-        self.messages.append(message)
+            header = f"Sending message to {self.host}:{self.port}"
+            min_width = 40
+            calculated_width = len(header) + 6
+            width = max(min_width, calculated_width)
+
+            print("=" * width)
+            print(header.center(width))
+            print("-" * width)
+
+            for line in messages_to_send:
+                print(line.center(width))
+
+            print("=" * width + "\n")
+
+            self.messages.append(message)
 
     def get_sent_messages(self, count: int = None):
         if count is None or len(self.messages) < count:
@@ -140,7 +155,7 @@ def extract_image_features(frames, video_processor):
 
 
 def format_message(message):
-    return message.replace("</s>", "")
+    return message.replace("</s>", "").replace("\n", "").replace("\\", "")
 
 
 def main(args):
@@ -190,11 +205,12 @@ def main(args):
     upd_sender = UDPMessageSender(host=udp_host, port=udp_port, max_messages=5)
 
     if args.save_output:
-        print("frame save activated")
+        print("\n[INFO]: OUTPUT SAVE ACTIVATED")
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         directory = os.path.join(args.save_output, f"frames_{timestamp}")
         os.makedirs(directory, exist_ok=True)
         frame_no = 0
+        all_llm_data = []
 
     try:
         last_frame_time = time.time()
@@ -231,7 +247,7 @@ def main(args):
                         inp = "".join(special_token) + "\n" + inp
                     conv.append_message(conv.roles[0], inp)
                     prompt = conv.get_prompt()
-                    print(f"prompt: {prompt}")
+                    print(f"prompt:\n{prompt}")
 
                     input_ids = (
                         tokenizer_image_token(
@@ -256,14 +272,18 @@ def main(args):
                             do_sample=True if args.temperature > 0 else False,
                             temperature=args.temperature,
                             max_new_tokens=args.max_new_tokens,
-                            streamer=streamer,
+                            # streamer=streamer, #if you want to stream the output, uncomment this
                             use_cache=True,
                             stopping_criteria=[stopping_criteria],
                         )
                         outputs = tokenizer.decode(output_ids[0, input_ids.shape[1] :]).strip()
                         conv.messages[-1][-1] = outputs
                         outputs = outputs.lower()
-                        print(f"model outputs: {outputs}")
+                        print("------------- MODEL OUTPUTS -------------")
+                        print(outputs)
+                        print("-----------------------------------------")
+
+                        upd_sender.send_message(message=outputs, format_function=format_message, history_num=5)
 
                         if args.save_output:
                             frame_directory = os.path.join(directory, f"{frame_no}")
@@ -281,27 +301,42 @@ def main(args):
                                 time.time() + nine_hours_in_seconds
                             ).strftime("%Y-%m-%d %H:%M:%S")
                             llm_data = {
+                                "frame_no": frame_no,
                                 "frame_recieved_time": frame_received_time_human,
                                 "llm_reasoning_time": llm_reasoning_time_human,
+                                "llm_reasoning_time_diff": current_time - last_frame_time,
                                 "llm_input": prompt,
                                 "llm_output": outputs,
+                                "sent_messages": upd_sender.get_sent_messages(count=5),
                             }
+                            all_llm_data.append(llm_data)
                             with open(llm_output_path, "w") as json_file:
                                 json.dump(llm_data, json_file, ensure_ascii=False, indent=4)
-
-                        upd_sender.send_message(message=outputs, format_function=format_message, history_num=5)
 
                     last_frame_time = current_time
 
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
                 except IndexError as e:
-                    print(f"Error during generation: {e}")
+                    print(f"\nError during generation: {e}")
                     print("Retrying...")
                     continue
+                except KeyboardInterrupt:
+                    print("\nKeyboard interrupt detected. Exiting...")
+                    break
+                except Exception as e:
+                    print(f"\nError during generation: {e}")
+                    print("Retrying...")
+                    continue
+
+    except KeyboardInterrupt:
+        print("\nProgram interrupted. Cleaning up...")
     finally:
         video_thread.stop()
         video_thread.join()
+        if args.save_output:
+            with open(os.path.join(args.save_output, "all_llm_data.json"), "w") as json_file:
+                json.dump(all_llm_data, json_file, ensure_ascii=False, indent=4)
 
 
 if __name__ == "__main__":
@@ -312,7 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--conv-mode", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--load-8bit", action="store_true")
     parser.add_argument("--load-4bit", action="store_true")
     parser.add_argument("--debug", action="store_true")
@@ -331,8 +366,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt",
         type=str,
-        required=True,
+        required=False,
         help="Input prompt for the model.",
     )
     args = parser.parse_args()
+    load_dotenv()
     main(args)
