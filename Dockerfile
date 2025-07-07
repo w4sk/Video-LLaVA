@@ -18,5 +18,5 @@ COPY pyproject.toml .
 RUN pip install --upgrade pip
 
 RUN pip install -e . && pip install -e ".[train]"
-RUN pip install numpy flash-attn==2.2.0 --no-build-isolation
+RUN pip install python-dotenv numpy flash-attn==2.2.0 --no-build-isolation
 RUN pip install decord git+https://github.com/facebookresearch/pytorchvideo.git@28fe037d212663c6a24f373b94cc5d478c8c1a1d

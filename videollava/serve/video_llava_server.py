@@ -31,14 +31,13 @@ from videollava.mm_utils import (
 
 
 class VideoCaptureThread(threading.Thread):
-    def __init__(self, port, output=None, buffer_size=500):
+    def __init__(self, port, output=None, buffer_size=500, fps=None):
         super().__init__(daemon=True)
         self.port = port
         self.output = output
         self._stop_event = threading.Event()
-
+        self.fps = fps
         self.frame_buffer = deque(maxlen=buffer_size)
-        self.last_capture_time = None
 
     def stop(self):
         self._stop_event.set()
@@ -57,7 +56,7 @@ class VideoCaptureThread(threading.Thread):
 
         out = None
         if self.output:
-            fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
+            fps = int(cap.get(cv2.CAP_PROP_FPS)) if self.fps is None else self.fps
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -66,14 +65,19 @@ class VideoCaptureThread(threading.Thread):
 
         print("Press 'q' to quit")
         try:
+            last_frame_time = time.time()
             while not self._stop_event.is_set():
-                ret, frame = cap.read()
-                if not ret:
-                    print("End of stream or read error")
-                    break
-                if out:
-                    out.write(frame)
-                _add_frame(frame=frame)
+                current_time = time.time()
+                if current_time - last_frame_time >= 1 / fps:
+                    ret, frame = cap.read()
+                    if not ret:
+                        print("End of stream or read error")
+                        break
+                    if out:
+                        out.write(frame)
+                    _add_frame(frame=frame)
+                    print(f"Captured frame at {current_time:.2f} seconds")
+                    last_frame_time = current_time
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
@@ -84,21 +88,13 @@ class VideoCaptureThread(threading.Thread):
             if out:
                 out.release()
 
-    def get_latest_frames(self, fps: float, num_frames: int):
-        if len(self.frame_buffer) < num_frames:
-            return []
-
-        now = self.frame_buffer[-1][0]
-        interval = 1.0 / fps
-
-        target_times = [now - i * interval for i in range(num_frames)]
-        frames = []
+    def get_latest_frames(self, num_frames: int):
         buffer_list = list(self.frame_buffer)
 
-        for target_time in target_times:
-            closest = min(buffer_list, key=lambda x: abs(x[0] - target_time))
-            frames.append(closest[1])
-        return frames
+        if len(buffer_list) < num_frames:
+            return []
+
+        return [frame[1] for frame in buffer_list[-num_frames:]]
 
 
 class UDPMessageSender:
@@ -192,7 +188,7 @@ def main(args):
         args.conv_mode = conv_mode
 
     # GStreamer Settings
-    video_thread = VideoCaptureThread(port=args.port, output=args.output)
+    video_thread = VideoCaptureThread(port=args.port, output=args.output, fps=args.fps)
     video_thread.start()
 
     # Socket Settings
@@ -207,127 +203,123 @@ def main(args):
     if args.save_output:
         print("\n[INFO]: OUTPUT SAVE ACTIVATED")
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        directory = os.path.join(args.save_output, f"frames_{timestamp}")
-        os.makedirs(directory, exist_ok=True)
+        save_directory = os.path.join(args.save_output, f"frames_{timestamp}")
+        os.makedirs(save_directory, exist_ok=True)
         frame_no = 0
         all_llm_data = []
 
     try:
-        last_frame_time = time.time()
         while True:
+            try:
+                process_start_time = time.time()
+                conv = conv_templates[args.conv_mode].copy()
 
-            current_time = time.time()
-            if current_time - last_frame_time >= 1 / args.fps:
-                try:
-                    conv = conv_templates[args.conv_mode].copy()
+                tensor = []
+                special_token = []
+                frames = video_thread.get_latest_frames(num_frames=8)
+                if not frames:
+                    continue
 
-                    tensor = []
-                    special_token = []
-                    frames = video_thread.get_latest_frames(fps=args.fps, num_frames=8)
-                    if not frames:
-                        continue
-
-                    video_tensor = extract_image_features(frames=frames, video_processor=video_processor)[
-                        "pixel_values"
-                    ][0].to(model.device, dtype=torch.float16)
-                    special_token += [DEFAULT_IMAGE_TOKEN] * model.get_video_tower().config.num_frames
-                    tensor.append(video_tensor)
-                    if not tensor:
-                        continue
-                    inp = args.prompt if args.prompt else os.environ.get("INPUT_PROMPT")
-                    if not inp:
-                        raise ValueError("INPUT_PROMPT environment variable must be set")
-                    if getattr(model.config, "mm_use_im_start_end", False):
-                        inp = (
-                            "".join([DEFAULT_IM_START_TOKEN + i + DEFAULT_IM_END_TOKEN for i in special_token])
-                            + "\n"
-                            + inp
-                        )
-                    else:
-                        inp = "".join(special_token) + "\n" + inp
-                    conv.append_message(conv.roles[0], inp)
-                    prompt = conv.get_prompt()
-                    print(f"prompt:\n{prompt}")
-
-                    input_ids = (
-                        tokenizer_image_token(
-                            prompt=prompt,
-                            tokenizer=tokenizer,
-                            image_token_index=IMAGE_TOKEN_INDEX,
-                            return_tensors="pt",
-                        )
-                        .unsqueeze(0)
-                        .to(model.device)
+                video_tensor = extract_image_features(frames=frames, video_processor=video_processor)["pixel_values"][
+                    0
+                ].to(model.device, dtype=torch.float16)
+                special_token += [DEFAULT_IMAGE_TOKEN] * model.get_video_tower().config.num_frames
+                tensor.append(video_tensor)
+                if not tensor:
+                    continue
+                inp = args.prompt if args.prompt else os.environ.get("INPUT_PROMPT")
+                if not inp:
+                    raise ValueError("INPUT_PROMPT environment variable must be set")
+                if getattr(model.config, "mm_use_im_start_end", False):
+                    inp = (
+                        "".join([DEFAULT_IM_START_TOKEN + i + DEFAULT_IM_END_TOKEN for i in special_token]) + "\n" + inp
                     )
+                else:
+                    inp = "".join(special_token) + "\n" + inp
+                conv.append_message(conv.roles[0], inp)
+                prompt = conv.get_prompt()
+                print(f"prompt:\n{prompt}")
 
-                    stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-                    keywords = [stop_str]
-                    stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-                    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+                input_ids = (
+                    tokenizer_image_token(
+                        prompt=prompt,
+                        tokenizer=tokenizer,
+                        image_token_index=IMAGE_TOKEN_INDEX,
+                        return_tensors="pt",
+                    )
+                    .unsqueeze(0)
+                    .to(model.device)
+                )
 
-                    with torch.inference_mode():
-                        output_ids = model.generate(
-                            input_ids,
-                            images=tensor,
-                            do_sample=True if args.temperature > 0 else False,
-                            temperature=args.temperature,
-                            max_new_tokens=args.max_new_tokens,
-                            # streamer=streamer, #if you want to stream the output, uncomment this
-                            use_cache=True,
-                            stopping_criteria=[stopping_criteria],
-                        )
-                        outputs = tokenizer.decode(output_ids[0, input_ids.shape[1] :]).strip()
-                        conv.messages[-1][-1] = outputs
-                        outputs = outputs.lower()
-                        print("------------- MODEL OUTPUTS -------------")
-                        print(outputs)
-                        print("-----------------------------------------")
+                stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+                keywords = [stop_str]
+                stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+                streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
-                        upd_sender.send_message(message=outputs, format_function=format_message, history_num=5)
+                with torch.inference_mode():
+                    output_ids = model.generate(
+                        input_ids,
+                        images=tensor,
+                        do_sample=True if args.temperature > 0 else False,
+                        temperature=args.temperature,
+                        max_new_tokens=args.max_new_tokens,
+                        # streamer=streamer, #if you want to stream the output, uncomment this
+                        use_cache=True,
+                        stopping_criteria=[stopping_criteria],
+                    )
+                    outputs = tokenizer.decode(output_ids[0, input_ids.shape[1] :]).strip()
+                    conv.messages[-1][-1] = outputs
+                    outputs = outputs.lower()
+                    print("------------- MODEL OUTPUTS -------------")
+                    print(outputs)
+                    print("-----------------------------------------")
 
-                        if args.save_output:
-                            frame_directory = os.path.join(directory, f"{frame_no}")
-                            os.makedirs(frame_directory, exist_ok=True)
-                            frame_no += 1
-                            for i, latest_frame in enumerate(frames):
-                                frame_filename = os.path.join(frame_directory, f"frame_{i}.jpg")
-                                cv2.imwrite(frame_filename, latest_frame)
-                            llm_output_path = os.path.join(frame_directory, "llm_output.json")
-                            nine_hours_in_seconds = 9 * 3600
-                            frame_received_time_human = datetime.datetime.fromtimestamp(
-                                current_time + nine_hours_in_seconds
-                            ).strftime("%Y-%m-%d %H:%M:%S")
-                            llm_reasoning_time_human = datetime.datetime.fromtimestamp(
-                                time.time() + nine_hours_in_seconds
-                            ).strftime("%Y-%m-%d %H:%M:%S")
-                            llm_data = {
-                                "frame_no": frame_no,
-                                "frame_recieved_time": frame_received_time_human,
-                                "llm_reasoning_time": llm_reasoning_time_human,
-                                "llm_reasoning_time_diff": current_time - last_frame_time,
-                                "llm_input": prompt,
-                                "llm_output": outputs,
-                                "sent_messages": upd_sender.get_sent_messages(count=5),
-                            }
-                            all_llm_data.append(llm_data)
-                            with open(llm_output_path, "w") as json_file:
-                                json.dump(llm_data, json_file, ensure_ascii=False, indent=4)
+                    upd_sender.send_message(message=outputs, format_function=format_message, history_num=5)
+                    process_finish_time = time.time()
 
-                    last_frame_time = current_time
+                    if args.save_output:
+                        frame_directory = os.path.join(save_directory, f"{frame_no}")
+                        os.makedirs(frame_directory, exist_ok=True)
+                        frame_no += 1
+                        for i, latest_frame in enumerate(frames):
+                            frame_filename = os.path.join(frame_directory, f"frame_{i}.jpg")
+                            cv2.imwrite(frame_filename, latest_frame)
+                        llm_output_path = os.path.join(frame_directory, "llm_output.json")
+                        nine_hours_in_seconds = 9 * 3600
+                        frame_received_time_human = datetime.datetime.fromtimestamp(
+                            process_start_time + nine_hours_in_seconds
+                        ).strftime("%Y-%m-%d %H:%M:%S")
+                        llm_reasoning_time_human = datetime.datetime.fromtimestamp(
+                            time.time() + nine_hours_in_seconds
+                        ).strftime("%Y-%m-%d %H:%M:%S")
+                        llm_data = {
+                            "frame_no": frame_no,
+                            "frame_recieved_time": frame_received_time_human,
+                            "llm_reasoning_time": llm_reasoning_time_human,
+                            "llm_reasoning_time_diff": process_start_time - process_finish_time,
+                            "llm_input": prompt,
+                            "llm_output": outputs,
+                            "sent_messages": upd_sender.get_sent_messages(count=5),
+                        }
+                        all_llm_data.append(llm_data)
+                        with open(llm_output_path, "w") as json_file:
+                            json.dump(llm_data, json_file, ensure_ascii=False, indent=4)
+
+                    process_start_time = time.time()
 
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
-                except IndexError as e:
-                    print(f"\nError during generation: {e}")
-                    print("Retrying...")
-                    continue
-                except KeyboardInterrupt:
-                    print("\nKeyboard interrupt detected. Exiting...")
-                    break
-                except Exception as e:
-                    print(f"\nError during generation: {e}")
-                    print("Retrying...")
-                    continue
+            except IndexError as e:
+                print(f"\nError during generation: {e}")
+                print("Retrying...")
+                continue
+            except KeyboardInterrupt:
+                print("\nKeyboard interrupt detected. Exiting...")
+                break
+            except Exception as e:
+                print(f"\nError during generation: {e}")
+                print("Retrying...")
+                continue
 
     except KeyboardInterrupt:
         print("\nProgram interrupted. Cleaning up...")
@@ -335,7 +327,7 @@ def main(args):
         video_thread.stop()
         video_thread.join()
         if args.save_output:
-            with open(os.path.join(args.save_output, "all_llm_data.json"), "w") as json_file:
+            with open(os.path.join(save_directory, "all_llm_data.json"), "w") as json_file:
                 json.dump(all_llm_data, json_file, ensure_ascii=False, indent=4)
 
 
