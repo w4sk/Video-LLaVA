@@ -68,13 +68,13 @@ class VideoCaptureThread(threading.Thread):
             last_frame_time = time.time()
             while not self._stop_event.is_set():
                 current_time = time.time()
+                ret, frame = cap.read()
+                if not ret:
+                    print("End of stream or read error")
+                    return
+                if out:
+                    out.write(frame)
                 if current_time - last_frame_time >= 1 / fps:
-                    ret, frame = cap.read()
-                    if not ret:
-                        print("End of stream or read error")
-                        break
-                    if out:
-                        out.write(frame)
                     _add_frame(frame=frame)
                     print(f"Captured frame at {current_time:.2f} seconds")
                     last_frame_time = current_time
