@@ -31,7 +31,7 @@ from videollava.mm_utils import (
 
 
 class VideoCaptureThread(threading.Thread):
-    def __init__(self, port, output=None, buffer_size=500, fps=None):
+    def __init__(self, port, output=None, buffer_size=500, fps=30):
         super().__init__(daemon=True)
         self.port = port
         self.output = output
@@ -56,7 +56,7 @@ class VideoCaptureThread(threading.Thread):
 
         out = None
         if self.output:
-            fps = int(cap.get(cv2.CAP_PROP_FPS)) if self.fps is None else self.fps
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -72,9 +72,9 @@ class VideoCaptureThread(threading.Thread):
                 if not ret:
                     print("End of stream or read error")
                     return
-                if out:
+                if self.output and out is not None:
                     out.write(frame)
-                if current_time - last_frame_time >= 1 / fps:
+                if current_time - last_frame_time >= 1 / self.fps:
                     _add_frame(frame=frame)
                     print(f"Captured frame at {current_time:.2f} seconds")
                     last_frame_time = current_time
