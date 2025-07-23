@@ -38,6 +38,7 @@ class VideoCaptureThread(threading.Thread):
         self._stop_event = threading.Event()
         self.fps = fps
         self.frame_buffer = deque(maxlen=buffer_size)
+        self.current_frame_number = -1
 
     def stop(self):
         self._stop_event.set()
@@ -76,7 +77,6 @@ class VideoCaptureThread(threading.Thread):
                     out.write(frame)
                 if current_time - last_frame_time >= 1 / self.fps:
                     _add_frame(frame=frame)
-                    print(f"Captured frame at {current_time:.2f} seconds")
                     last_frame_time = current_time
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -92,6 +92,9 @@ class VideoCaptureThread(threading.Thread):
         buffer_list = list(self.frame_buffer)
 
         if len(buffer_list) < num_frames:
+            if len(buffer_list) != self.current_frame_number:
+                print(f"Please wait, not enough frames in the buffer: {len(buffer_list)}/{num_frames}")
+                self.current_frame_number = len(buffer_list)
             return []
 
         return [frame[1] for frame in buffer_list[-num_frames:]]
@@ -104,10 +107,11 @@ class UDPMessageSender:
         self.messages = deque(maxlen=max_messages)
 
     def send_message(self, message: str, format_function=None, history_num=None):
+        print(f"history_num: {history_num}")
         if format_function:
             message = format_function(message)
         messages_to_send = []
-        if history_num is not None:
+        if history_num is not None and history_num > 1:
             messages_to_send.extend(self.get_sent_messages(count=history_num - 1))
         messages_to_send.append(message)
         full_message = "\n".join(messages_to_send)
@@ -274,7 +278,7 @@ def main(args):
                     print(outputs)
                     print("-----------------------------------------")
 
-                    upd_sender.send_message(message=outputs, format_function=format_message, history_num=5)
+                    upd_sender.send_message(message=outputs, format_function=format_message, history_num=1)
                     process_finish_time = time.time()
 
                     if args.save_output:
