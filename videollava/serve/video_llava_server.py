@@ -232,15 +232,21 @@ def main(args):
                 if not tensor:
                     continue
                 inp = args.prompt if args.prompt else os.environ.get("INPUT_PROMPT")
-                if not inp:
+                if os.path.isfile(inp):
+                    with open(inp, "r") as f:
+                        input_prompt = f.read().strip()
+                else:
+                    input_prompt = inp
+
+                if not input_prompt:
                     raise ValueError("INPUT_PROMPT environment variable must be set")
                 if getattr(model.config, "mm_use_im_start_end", False):
-                    inp = (
+                    input_prompt = (
                         "".join([DEFAULT_IM_START_TOKEN + i + DEFAULT_IM_END_TOKEN for i in special_token]) + "\n" + inp
                     )
                 else:
-                    inp = "".join(special_token) + "\n" + inp
-                conv.append_message(conv.roles[0], inp)
+                    input_prompt = "".join(special_token) + "\n" + input_prompt
+                conv.append_message(conv.roles[0], input_prompt)
                 prompt = conv.get_prompt()
                 print(f"prompt:\n{prompt}")
 
